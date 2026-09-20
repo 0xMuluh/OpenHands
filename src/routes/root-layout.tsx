@@ -25,6 +25,8 @@ import { ReactRouterNavigationProvider } from "./react-router-navigation-provide
 import { OnboardingHost } from "#/components/features/onboarding";
 import { isOnboardingPreviewActive } from "#/components/features/onboarding/onboarding-preview";
 import { CanvasExtensionsRuntimeProvider } from "#/components/features/canvas-extensions/canvas-extensions-runtime";
+import { isEmbedded } from "#/integrations/omicsbase/policy";
+import { cn } from "#/utils/utils";
 
 const EnvironmentSwitchOverlay = React.lazy(
   () => import("#/components/features/backends/environment-switch-overlay"),
@@ -115,10 +117,13 @@ export default function MainApp() {
         <SidebarMobileNavProvider>
           <div
             data-testid="root-layout"
-            className="h-screen lg:min-w-5xl flex flex-col md:flex-row bg-base overflow-hidden p-0"
+            className={cn(
+              "h-screen flex flex-col md:flex-row bg-base overflow-hidden p-0",
+              !isEmbedded() && "lg:min-w-5xl",
+            )}
           >
             <title>{appTitle}</title>
-            <Sidebar />
+            {!isEmbedded() && <Sidebar />}
 
             <div className="flex min-h-0 flex-col w-full min-w-0 h-full gap-3">
               {!hideMobileSidebarMenuBar ? <SidebarMobileMenuBar /> : null}
