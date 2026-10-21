@@ -1,4 +1,5 @@
 import {
+  type ACPModelInfo,
   ConversationSortOrder,
   type ForkConversationRequest,
   type LLMConfig,
@@ -14,7 +15,11 @@ import { v4 as uuidv4 } from "uuid";
 import { AgentKind, Provider } from "#/types/settings";
 import type { ConversationRuntimeContext } from "#/api/conversation-file-upload.api";
 import { getAgentServerWorkingDir } from "../agent-server-config";
-import { resolveNewConversationWorkspace } from "../conversation-workspace";
+import {
+  resolveConversationHooksProjectDir,
+  resolveNewConversationWorkspace,
+} from "../conversation-workspace";
+import HooksService from "../hooks-service";
 import {
   getActiveBackend,
   getEffectiveLocalBackend,
@@ -30,6 +35,7 @@ import {
   readCloudConversationFile,
   searchCloudConversations,
   updateCloudConversationPublicFlag,
+  updateCloudConversationRepository,
   updateCloudConversationTitle,
 } from "../cloud/conversation-service.api";
 import {
@@ -43,6 +49,7 @@ import {
   getDefaultConversationTitle,
   toAppConversation,
   toConversationPage,
+  toHooksResponse,
 } from "../agent-server-adapter";
 import { GetVSCodeUrlResponse } from "../open-hands.types";
 import {
@@ -60,7 +67,12 @@ import {
   type WorkspaceMode,
 } from "../conversation-metadata-store";
 import { resolveTitleLlmProfile } from "#/utils/title-llm-profile";
+import { toAcpModelOptions } from "#/constants/acp-providers";
 import { isPlannerConversationOf } from "#/utils/plan-file";
+import { buildAutomationSetupModeTags } from "#/utils/automation-draft-tags";
+import { AUTOMATION_FORM_UPDATE_CLIENT_TOOL } from "../automation-form-client-tool";
+import { CANVAS_UI_CLIENT_TOOL } from "../canvas-ui-client-tool";
+import { LAUNCH_CHILD_CONVERSATION_CLIENT_TOOL } from "../launch-child-conversation-client-tool";
 import type {
   GetHooksResponse,
   PluginSpec,
@@ -102,6 +114,20 @@ function numberOrZero(value: unknown): number {
 
 function stringOrNull(value: unknown): string | null {
   return typeof value === "string" ? value : null;
+}
+
+function normalizeAcpModels(value: unknown): ACPModelInfo[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    if (!isRecord(entry) || typeof entry.model_id !== "string") return [];
+    return [
+      {
+        model_id: entry.model_id,
+        name: stringOrNull(entry.name),
+        description: stringOrNull(entry.description),
+      },
+    ];
+  });
 }
 
 function readTimestamp(
@@ -239,11 +265,21 @@ function normalizeLaunchedAgentProfile(
   value: unknown,
 ): DirectConversationInfo["launched_agent_profile"] {
   if (!isRecord(value)) return null;
-  const { agent_profile_id: agentProfileId, revision } = value;
+  const {
+    agent_profile_id: agentProfileId,
+    revision,
+    secret_refs: secretRefs,
+  } = value;
   if (typeof agentProfileId !== "string" || typeof revision !== "number") {
     return null;
   }
-  return { agent_profile_id: agentProfileId, revision };
+  return {
+    agent_profile_id: agentProfileId,
+    revision,
+    secret_refs: Array.isArray(secretRefs)
+      ? secretRefs.filter((name): name is string => typeof name === "string")
+      : null,
+  };
 }
 
 function normalizeAbsolutePath(path: string): string | null {
@@ -310,6 +346,7 @@ function requireDirectConversationInfo(item: unknown): DirectConversationInfo {
     // omit these — adapter handles ``undefined`` / ``null`` gracefully.
     current_model_id: stringOrNull(item.current_model_id),
     current_model_name: stringOrNull(item.current_model_name),
+    available_models: normalizeAcpModels(item.available_models),
   };
 }
 
@@ -320,6 +357,22 @@ function requireDirectConversationItems(
     throw invalidConversationResponse();
   }
   return items.map(requireDirectConversationInfo);
+}
+
+/**
+ * Validates a `GET /api/conversations?ids=...` response. The agent server
+ * answers `null` for each id it does not have, so a `null` entry means "not
+ * found" (the caller decides how to report it), not an incompatible response.
+ */
+function requireDirectConversationBatch(
+  items: unknown,
+): (DirectConversationInfo | null)[] {
+  if (!Array.isArray(items)) {
+    throw invalidConversationResponse();
+  }
+  return items.map((item) =>
+    item === null ? null : requireDirectConversationInfo(item),
+  );
 }
 
 function requireConversationSearchPage(page: unknown): {
@@ -378,6 +431,8 @@ function requireAppConversation(
  */
 export interface CreateConversationOptions {
   initialUserMsg?: string;
+  automationSetup?: boolean;
+  automationSetupTags?: Record<string, string>;
   conversationInstructions?: string;
   plugins?: PluginSpec[];
   metadata?: ConversationMetadata | null;
@@ -386,22 +441,19 @@ export interface CreateConversationOptions {
   parentConversationId?: string;
   agentType?: "default" | "plan";
   sandboxId?: string;
-  // Launch from a saved AgentProfile (resolved server-side) instead of the
-  // current encrypted agent_settings (#3727). Supported on both local and the
-  // cloud app-server (OpenHands #15060): local threads it through the
-  // encrypted-settings builder; cloud sends it as a flat request field.
+  // The saved AgentProfile the server builds the agent from (#3727). Required
+  // on local; cloud without one launches the org's default (OpenHands #15060).
   agentProfileId?: string;
   agentProfileKind?: AgentKind;
   /**
-   * Whether the first message should be routed through the active Model
-   * Router. Only consumed on the cloud path — the local path reads the
-   * toggle from its own settings fetch. Threaded in by the caller from the
-   * warmed settings query to avoid a settings round-trip on the cloud hot
-   * path.
+   * Cloud only: whether the first message should be routed through the
+   * active Model Router. The local path reads the toggle from its own
+   * settings fetch. Threaded in by the caller from the warmed settings query
+   * to avoid a settings round-trip on the cloud hot path.
    */
   runRouterAtConversationStart?: boolean;
   /**
-   * Whether a Model Router meta-profile is currently active. The
+   * Cloud only: whether a Model Router meta-profile is currently active. The
    * route-at-start suffix is only emitted when this is true AND
    * ``runRouterAtConversationStart`` is on — without an active meta-profile
    * the agent-server does not attach ``route_task_to_model``, so the
@@ -409,11 +461,16 @@ export interface CreateConversationOptions {
    * by the caller from the warmed meta-profiles query.
    */
   hasActiveMetaProfile?: boolean;
-  // The LLM profile pinned to the launched agent profile (llm_profile_ref).
-  // When set and no explicit title_llm_profile preference exists, title
-  // generation uses this profile so both the agent and its title use the
-  // same model.
+  /** Local only: the launched profile carries a Model Router. */
+  profileHasRouter?: boolean;
+  /** Local only: the launched ACP profile's server, for the conversation tag. */
+  acpServer?: string;
+  // The LLM profile the launched agent profile runs. When set and no explicit
+  // title_llm_profile preference exists, title generation uses this profile so
+  // both the agent and its title use the same model.
   agentLlmProfileRef?: string | null;
+  /** Local only: run the agent profile with this LLM profile instead of its own. */
+  agentLlmProfileOverride?: string;
 }
 
 class AgentServerConversationService {
@@ -459,6 +516,8 @@ class AgentServerConversationService {
   ): Promise<AppConversationStartTask> {
     const {
       initialUserMsg,
+      automationSetup,
+      automationSetupTags,
       conversationInstructions,
       plugins,
       metadata,
@@ -470,6 +529,9 @@ class AgentServerConversationService {
       agentProfileId,
       agentProfileKind,
       agentLlmProfileRef,
+      agentLlmProfileOverride,
+      profileHasRouter,
+      acpServer,
     } = options;
 
     if (getActiveBackend().backend.kind === "cloud") {
@@ -511,10 +573,25 @@ class AgentServerConversationService {
             }
           : {}),
         trigger: "gui",
+        ...(automationSetup
+          ? { tags: buildAutomationSetupModeTags(automationSetupTags) }
+          : {}),
+        ...(automationSetup && agentProfileKind !== "acp"
+          ? {
+              client_tools: [
+                CANVAS_UI_CLIENT_TOOL,
+                LAUNCH_CHILD_CONVERSATION_CLIENT_TOOL,
+                AUTOMATION_FORM_UPDATE_CLIENT_TOOL,
+              ],
+            }
+          : {}),
       };
       return createCloudAppConversation(request);
     }
 
+    if (!agentProfileId) {
+      throw new Error("A local conversation needs an agent profile.");
+    }
     const [settings, profiles] = await Promise.all([
       SettingsService.getSettings(),
       ProfilesService.listProfiles().catch(() => undefined),
@@ -539,6 +616,8 @@ class AgentServerConversationService {
     const payload = await buildStartConversationRequestWithEncryptedSettings({
       settings,
       query: initialUserMsg,
+      automationSetup,
+      automationSetupTags,
       conversationInstructions,
       plugins,
       conversationId,
@@ -552,6 +631,9 @@ class AgentServerConversationService {
       worktree: !isolated && resolvedWorkspaceMode === "new_worktree",
       agentProfileId,
       agentProfileKind,
+      llmProfileOverride: agentLlmProfileOverride,
+      profileHasRouter,
+      acpServer,
       titleLlmProfile,
     });
 
@@ -783,12 +865,12 @@ class AgentServerConversationService {
       return batchGetCloudConversations(ids);
     }
 
-    const data = await new ConversationClient(
+    const data: unknown = await new ConversationClient(
       getAgentServerClientOptions(),
     ).getConversations<DirectConversationInfo>(ids);
 
-    return requireDirectConversationItems(data).map((item) =>
-      toAppConversation(item),
+    return requireDirectConversationBatch(data).map((item) =>
+      item ? toAppConversation(item) : null,
     );
   }
 
@@ -806,15 +888,34 @@ class AgentServerConversationService {
     conversationId: string,
     repository: string | null,
     branch?: string | null,
-    gitProvider?: string | null,
+    gitProvider?: Provider | null,
   ): Promise<AppConversation> {
+    // Cloud conversations keep the repository on the server, so other
+    // browsers and server features see it. Best effort: an older server can
+    // reject some names (e.g. Azure DevOps org/project/repo), and Connect Repo
+    // must still work, so a failure keeps the local selection only.
+    if (getActiveBackend().backend.kind === "cloud") {
+      try {
+        await updateCloudConversationRepository(
+          conversationId,
+          repository,
+          branch ?? null,
+          gitProvider ?? null,
+        );
+      } catch (error) {
+        console.warn(
+          `Failed to save the repository of conversation ${conversationId}`,
+          error,
+        );
+      }
+    }
     if (repository) {
       const existing = getStoredConversationMetadata(conversationId);
       setStoredConversationMetadata(conversationId, {
         ...(existing ?? {}),
         selected_repository: repository,
         selected_branch: branch ?? null,
-        git_provider: (gitProvider as Provider | null | undefined) ?? null,
+        git_provider: gitProvider ?? null,
       });
     } else {
       removeStoredConversationMetadata(conversationId);
@@ -860,11 +961,20 @@ class AgentServerConversationService {
     );
   }
 
+  /**
+   * Hooks of the workspace a local conversation runs in, re-read on each call
+   * so the dialog's Refresh picks up `.openhands/hooks.json` edits. Cloud has
+   * no per-conversation hooks route, so it keeps an empty list.
+   */
   static async getHooks(conversationId: string): Promise<GetHooksResponse> {
-    if (!conversationId) {
+    if (!conversationId || !getEffectiveLocalBackend()) {
       return emptyHooksResponse();
     }
-    return emptyHooksResponse();
+    const projectDir = await resolveConversationHooksProjectDir(
+      getStoredConversationMetadata(conversationId)?.selected_workspace,
+    );
+    if (projectDir === null) return emptyHooksResponse();
+    return toHooksResponse(await HooksService.fetchWorkspaceHooks(projectDir));
   }
 
   static async getRuntimeConversation(
@@ -891,6 +1001,7 @@ class AgentServerConversationService {
       updated_at: data.updated_at,
       status: toRuntimeStatus(data.execution_status),
       stats: data.stats ?? { usage_to_metrics: {} },
+      available_models: toAcpModelOptions(data.available_models),
     };
   }
 
