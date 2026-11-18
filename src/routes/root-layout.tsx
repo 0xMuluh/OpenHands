@@ -29,7 +29,6 @@ import { ReactRouterNavigationProvider } from "./react-router-navigation-provide
 import { OnboardingHost } from "#/components/features/onboarding";
 import { isOnboardingPreviewActive } from "#/components/features/onboarding/onboarding-preview";
 import { CanvasExtensionsRuntimeProvider } from "#/components/features/canvas-extensions/canvas-extensions-runtime";
-import { isEmbedded } from "#/integrations/omicsbase/policy";
 import { isMacDesktopShell } from "#/utils/desktop-shell";
 import { useDesktopFullScreen } from "#/hooks/use-desktop-full-screen";
 import { cn } from "#/utils/utils";
@@ -173,14 +172,13 @@ function MainAppContent() {
           <div
             data-testid="root-layout"
             className={cn(
-              "app-shell-safe-area h-dvh flex flex-col md:flex-row bg-canvas-base overflow-hidden p-0",
-              !isEmbedded() && "lg:min-w-5xl",
+              "app-shell-safe-area h-dvh lg:min-w-5xl flex flex-col md:flex-row bg-canvas-base overflow-hidden p-0",
               showTitleBarBand && "app-shell-titlebar-inset",
             )}
           >
             <DocumentTitle />
             <TitleBarDragRegion />
-            {!isEmbedded() && <Sidebar />}
+            <Sidebar />
 
             <div className="flex min-h-0 flex-col w-full min-w-0 h-full gap-3">
               {!hideMobileSidebarMenuBar ? <SidebarMobileMenuBar /> : null}
